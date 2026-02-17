@@ -1,19 +1,10 @@
 """
 Reveal Grid Game — Tkinter (multiple selectable grids via dropdown)
 
-Features:
-- Pick a grid set from a dropdown (OptionMenu)
-- Grid + axis labels update immediately on selection
-- Arbitrary dimensions inferred from the selected CELL_TEXTS
-- Turn flow:
-    1) Random covered cell is highlighted (still hidden)
-    2) SPACE reveals its content
-    3) ← Incorrect (re-covers) or → Correct (stays uncovered)
-- Timer starts on first highlight; shows elapsed live; shows total at end
-- Switching dropdown resets the game (fresh timer/score)
-
-Run:
-    python reveal_game.py
+NEW:
+- "Shuffle cases" button: randomizes the display order of
+  Nominative / Accusative / Genitive / Dative rows for the duration of the game.
+  (Press again to reshuffle; switching grids resets the game.)
 """
 
 import random
@@ -161,7 +152,7 @@ GRIDS = [
         col_labels=["Masculine", "Feminine", "Neuter"],
         row_labels=["Nominative", "Genitive", "Dative", "Accusative"],
     ),
-    
+
     # ---------------- FUTURE ----------------
 
     GridSpec(
@@ -175,7 +166,7 @@ GRIDS = [
         col_labels=["Masculine", "Feminine", "Neuter"],
         row_labels=["Nominative", "Genitive", "Dative", "Accusative"],
     ),
-    
+
     GridSpec(
         name="Future Middle Participle (Singular)",
         cell_texts=[
@@ -187,7 +178,7 @@ GRIDS = [
         col_labels=["Masculine", "Feminine", "Neuter"],
         row_labels=["Nominative", "Genitive", "Dative", "Accusative"],
     ),
-    
+
     GridSpec(
         name="Future Passive Participle (Singular)",
         cell_texts=[
@@ -199,7 +190,6 @@ GRIDS = [
         col_labels=["Masculine", "Feminine", "Neuter"],
         row_labels=["Nominative", "Genitive", "Dative", "Accusative"],
     ),
-
 ]
 
 
@@ -274,6 +264,10 @@ class RevealGame:
         self.end_time = None
         self._timer_running = False
 
+        # NEW: row ordering for display vs underlying cell_texts
+        self.row_order: List[int] = []               # display_row -> source_row
+        self.case_shuffle_order: Optional[List[int]] = None  # stored per game
+
         # widgets
         self.frame = None
         self.header_frame = None
@@ -317,6 +311,14 @@ class RevealGame:
         )
         self.dropdown.grid(row=0, column=1, sticky="w")
 
+        # NEW: shuffle button
+        self.shuffle_btn = tk.Button(
+            self.header_frame,
+            text="Shuffle cases",
+            command=self.shuffle_case_rows_for_game,
+        )
+        self.shuffle_btn.grid(row=0, column=2, sticky="w", padx=(10, 0))
+
         # Info label
         self.info_label = tk.Label(self.frame, textvariable=self.info_var, justify="left", anchor="w")
         self.info_label.grid(row=1, column=0, sticky="w", pady=(8, 8))
@@ -343,6 +345,38 @@ class RevealGame:
         self.root.bind("a", lambda e: self.handle_guess(is_correct=False))
         self.root.bind("d", lambda e: self.handle_guess(is_correct=True))
 
+    # -------- NEW: shuffle cases --------
+    def shuffle_case_rows_for_game(self):
+        """
+        Randomizes the order of Nominative/Genitive/Dative/Accusative rows (if present)
+        and restarts the game using that display order.
+        """
+        # Need current labels to detect case rows; use normalized labels from current grid.
+        cell_texts = self.current_grid.cell_texts
+        rows = len(cell_texts)
+        base_labels = _normalize_labels(self.current_grid.row_labels, rows, _default_row_labels)
+
+        wanted = {"nominative", "genitive", "dative", "accusative"}
+        idxs = [i for i, lbl in enumerate(base_labels) if str(lbl).strip().lower() in wanted]
+
+        if len(idxs) != 4:
+            messagebox.showinfo(
+                "Shuffle cases",
+                "This grid doesn't have exactly the four case rows (Nominative/Genitive/Dative/Accusative),\n"
+                "so there's nothing to shuffle here."
+            )
+            return
+
+        shuffled = random.sample(idxs, k=len(idxs))
+        # Build a display->source mapping:
+        # rows not in idxs stay in place; the four case rows are reassigned in shuffled order.
+        row_order = list(range(rows))
+        for display_i, source_i in zip(idxs, shuffled):
+            row_order[display_i] = source_i
+
+        self.case_shuffle_order = row_order
+        self.reset_game()
+
     # -------- grid switching / rebuilding --------
     def set_grid_by_name(self, name: str):
         match = next((g for g in self.grids if g.name == name), None)
@@ -350,6 +384,9 @@ class RevealGame:
             return
         self.current_grid = match
         self.grid_choice_var.set(match.name)
+
+        # switching grids resets the game; keep whatever shuffle mapping was last set,
+        # but only apply it if it matches the new row count (handled in reset_game).
         self.reset_game()
 
     def reset_game(self):
@@ -360,8 +397,19 @@ class RevealGame:
         cell_texts = self.current_grid.cell_texts
         self.rows = len(cell_texts)
         self.cols = len(cell_texts[0])
-        self.row_labels = _normalize_labels(self.current_grid.row_labels, self.rows, _default_row_labels)
+        base_row_labels = _normalize_labels(self.current_grid.row_labels, self.rows, _default_row_labels)
         self.col_labels = _normalize_labels(self.current_grid.col_labels, self.cols, _default_col_labels)
+
+        # NEW: apply row_order if we have a valid stored shuffle mapping; otherwise identity
+        if self.case_shuffle_order is not None and len(self.case_shuffle_order) == self.rows:
+            self.row_order = list(self.case_shuffle_order)
+        else:
+            self.row_order = list(range(self.rows))
+            # don't carry an invalid mapping forward
+            self.case_shuffle_order = None
+
+        # Display labels should follow display row indices
+        self.row_labels = [base_row_labels[self.row_order[r]] for r in range(self.rows)]
 
         self.uncovered = [[False] * self.cols for _ in range(self.rows)]
         self.active_cell = None
@@ -521,11 +569,14 @@ class RevealGame:
 
     # -------- rendering --------
     def _cell_display_text(self, r, c):
+        # NEW: map display row r -> source row in the underlying grid
+        source_r = self.row_order[r] if self.row_order else r
         cell_texts = self.current_grid.cell_texts
+
         if self.uncovered[r][c]:
-            return str(cell_texts[r][c])
+            return str(cell_texts[source_r][c])
         if self.active_cell == (r, c) and self.active_revealed:
-            return str(cell_texts[r][c])
+            return str(cell_texts[source_r][c])
         return "•••"
 
     def _redraw(self):
@@ -550,10 +601,14 @@ class RevealGame:
                     "← Incorrect / → Correct"
                 )
 
+        shuffle_note = ""
+        if self.case_shuffle_order is not None:
+            shuffle_note = " | Cases: shuffled"
+
         self.info_var.set(
             f"Grid: {self.current_grid.name}\n"
             f"{status}\n"
-            f"Score: Correct {self.correct} | Incorrect {self.incorrect} | Remaining {remaining} | {time_line}"
+            f"Score: Correct {self.correct} | Incorrect {self.incorrect} | Remaining {remaining} | {time_line}{shuffle_note}"
         )
 
         for r in range(self.rows):
